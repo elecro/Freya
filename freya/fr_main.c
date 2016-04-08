@@ -129,51 +129,61 @@ static HChar dir_buffer[DIR_BUFFER_SIZE];
 // Head of the trace
 static Trace_Block* trace_head = NULL;
 
+static Bool is_json = False;
+
 static void fr_print_block(VgFile* fp, Trace_Block* block)
 {
-   UInt linenum;
-   Bool dirname_available = False;
-   const HChar* file_ptr;
-   const HChar* dir_ptr;
-
    if (block->ips) {
-      if (VG_(get_fnname)( block->ips, &fnname_buffer ))
-         VG_(fprintf)(fp, "%s ", fnname_buffer);
+      const HChar* fname = NULL;
+      const HChar* file_ptr = NULL;
+      const HChar* dir_ptr = NULL;
+      UInt linenum;
 
-      if (VG_(get_filename_linenum)( block->ips, &file_ptr, &dir_ptr, &linenum)) {
-         dirname_available = dir_ptr[0] != '\0';
-         if (!dirname_available)
-            VG_(fprintf)(fp, "(%s:%d)\n", file_ptr, linenum);
-         else
-            VG_(fprintf)(fp, "(%s/%s:%d)\n", dir_ptr, file_ptr, linenum);
-         return;
+      VG_(get_fnname)(block->ips, &fname);
+
+      if (VG_(get_filename_linenum)(block->ips, &file_ptr, &dir_ptr, &linenum)) {
+         const HChar* separator = ((dir_ptr[0] != '\0') ? "/" : "");
+         VG_(fprintf)(fp, is_json
+                       ? "\"Name\": \"%s\", \"File\": \"%s%s%s\", \"Line\": %d"
+                       : "%s (%s%s%s:%d)\n",
+                      fname, dir_ptr, separator, file_ptr, linenum);
+      } else {
+         if (!VG_(get_objname)(block->ips, &file_ptr))
+            file_ptr = "Unknown file";
+
+         VG_(fprintf)(fp, is_json
+                       ? "\"Name\": \"%s\", \"File\": \"%s\""
+                       : "%s (%s)\n",
+                      fname, file_ptr);
       }
-
-      if (VG_(get_objname)( block->ips, &dir_ptr))
-         VG_(fprintf)(fp, "(%s)\n", dir_ptr);
-      else
-         VG_(fprintf)(fp, "(Unknown file)\n");
-   } else
-      VG_(fprintf)(fp, "Group: %s\n", block->name);
+   } else {
+      VG_(fprintf)(fp, is_json
+                    ? " \"Group\": { \"Name\": \"%s\""
+                    : "Group: %s\n" ,
+                   block->name);
+   }
 }
 
 static void fr_print_bytes(VgFile* fp, const HChar* name, Long value)
 {
-    VG_(fprintf)(fp, "%s", name);
-    if (value > 1024 * 1024)
-        VG_(fprintf)(fp, "%lld.%lldMb ", value / (1024 * 1024), (value * 10 / (1024 * 1024)) % 10);
-    else if (value > 1024)
-        VG_(fprintf)(fp, "%lld.%lldKb ", value / 1024, (value * 10 / 1024) % 10);
-    else {
-        VG_(fprintf)(fp, "%lldb ", value);
-        return;
-    }
-    VG_(fprintf)(fp, "(%lldb) ", value);
+   if (is_json)
+      VG_(fprintf)(fp, " \"%s\": %lld, ", name, value);
+   else {
+      VG_(fprintf)(fp, "%s: ", name);
+      if (value > 1024 * 1024)
+         VG_(fprintf)(fp, "%lld.%lldMb ", value / (1024 * 1024), (value * 10 / (1024 * 1024)) % 10);
+      else if (value > 1024)
+         VG_(fprintf)(fp, "%lld.%lldKb ", value / 1024, (value * 10 / 1024) % 10);
+      else {
+         VG_(fprintf)(fp, "%lldb ", value);
+         return;
+      }
+      VG_(fprintf)(fp, "(%lldb) ", value);
+   }
 }
 
 static void fr_sort_and_dump(VgFile* fp, Trace_Block* block, Int indent)
 {
-   Int i;
    Trace_Block* from;
    Trace_Block* from_prev;
    Trace_Block* max;
@@ -188,13 +198,24 @@ static void fr_sort_and_dump(VgFile* fp, Trace_Block* block, Int indent)
       if (block->peak < clo_min)
          return;
 
-      for (i = 0; i < indent; ++i)
-         VG_(fprintf)(fp, "  ");
-      VG_(fprintf)(fp, "[%d] ", indent);
+      if (!is_json) VG_(fprintf)(fp, "%*s", indent * 2, "");
+      VG_(fprintf)(fp, (is_json ? "{ \"indent\": %d, " : "[%d] "), indent);
       fr_print_block(fp, block);
 
-      if (block->first)
+      if (block->first) {
+         if (is_json) VG_(fprintf)(fp, ", \"Children\": [");
          fr_sort_and_dump(fp, block->first, indent + 1);
+         if (is_json) VG_(fprintf)(fp, "] ");
+      }
+
+      if (is_json) {
+         if (!block->ips) {
+            // We are inside a group, close it down
+            VG_(fprintf)(fp, "}");
+         }
+
+         VG_(fprintf)(fp, " }");
+      }
       return;
    }
 
@@ -246,26 +267,42 @@ static void fr_sort_and_dump(VgFile* fp, Trace_Block* block, Int indent)
       if (block->peak < clo_min)
          return;
 
-      for (i = 0; i < indent; ++i)
-         VG_(fprintf)(fp, "  ");
+      if (!is_json) VG_(fprintf)(fp, "%*s", indent * 2, "");
+      VG_(fprintf)(fp, (is_json ? "{ \"indent\": %d, " : "[%d] "), indent);
 
-      VG_(fprintf)(fp, "[%d] ", indent);
-      fr_print_bytes(fp, "Peak: ", block->peak);
-      VG_(fprintf)(fp, "Allocs: %d ", block->allocs);
-      VG_(fprintf)(fp, "Reallocs: %d ", block->reallocs);
-      fr_print_bytes(fp, "Total: ", block->total);
+      fr_print_bytes(fp, "Peak", block->peak);
+      VG_(fprintf)(fp, is_json
+                    ? "\"Allocs\": %d, \"Reallocs\": %d,"
+                    : "Allocs: %d Reallocs: %d",
+                   block->allocs, block->reallocs);
+      fr_print_bytes(fp, "Total", block->total);
+
       if (block->current > 0)
-         fr_print_bytes(fp, "Leak: ", block->current);
-      VG_(fprintf)(fp, "\n");
+         fr_print_bytes(fp, "Leak", block->current);
 
-      for (i = 0; i < indent; ++i)
-         VG_(fprintf)(fp, "  ");
+      if (!is_json) VG_(fprintf)(fp, "\n%*s", indent * 2, "");
+
       fr_print_block(fp, block);
 
-      if (block->first)
+      if (block->first) {
+         if (is_json) VG_(fprintf)(fp, ", \"Children\": [");
          fr_sort_and_dump(fp, block->first, indent + 1);
+         if (is_json) VG_(fprintf)(fp, "] ");
+      }
+
+      if (is_json) {
+         if (!block->ips) {
+            // We are inside a group, close it down
+            VG_(fprintf)(fp, "}");
+         }
+
+         VG_(fprintf)(fp, " }");
+      }
 
       block = block->next;
+      if (is_json && block) {
+        VG_(fprintf)(fp, ", ");
+      }
    }
 }
 
@@ -291,20 +328,40 @@ static VgFile* fr_output_open(void)
 
 static void fr_output_header(VgFile* fp)
 {
-   VG_(fprintf)(fp, "%s %s - %s\n", TOOL_NAME, TOOL_VERSION, TOOL_DESC);
-   VG_(fprintf)(fp, "Command: %s", VG_(args_the_exename));
+   if (is_json) {
+      VG_(fprintf)(fp, "{ \"tool\": \"%s\",  \"version\": \"%s\", \"desc\": \"%s\", ", TOOL_NAME, TOOL_VERSION, TOOL_DESC);
+      VG_(fprintf)(fp, " \"command\": \"%s", VG_(args_the_exename));
 
-   for (Int i = 0; i < VG_(sizeXA)(VG_(args_for_client)); i++) {
-      const HChar *arg = *(HChar**)VG_(indexXA)(VG_(args_for_client), i);
-      VG_(fprintf)(fp, " %s", arg);
+      for (Int i = 0; i < VG_(sizeXA)(VG_(args_for_client)); i++) {
+         const HChar *arg = *(HChar**)VG_(indexXA)(VG_(args_for_client), i);
+         VG_(fprintf)(fp, " %s", arg);
+      }
+
+      VG_(fprintf)(fp, "\",");
+      VG_(fprintf)(fp, " \"parent\": %d, ", VG_(getppid)());
+      VG_(fprintf)(fp, " \"current\": %d, ", VG_(getpid)());
+      VG_(fprintf)(fp, " \"trace\": ");
+   } else {
+      VG_(fprintf)(fp, "%s %s - %s\n", TOOL_NAME, TOOL_VERSION, TOOL_DESC);
+      VG_(fprintf)(fp, "Command: %s", VG_(args_the_exename));
+
+      for (Int i = 0; i < VG_(sizeXA)(VG_(args_for_client)); i++) {
+         const HChar *arg = *(HChar**)VG_(indexXA)(VG_(args_for_client), i);
+         VG_(fprintf)(fp, " %s", arg);
+      }
+
+      VG_(fprintf)(fp, "\n");
+      VG_(fprintf)(fp, "Parent PID: %d\n", VG_(getppid)());
+      VG_(fprintf)(fp, "Current PID: %d\n", VG_(getpid)());
+      VG_(fprintf)(fp, "\nTrace: \n\n");
    }
-   VG_(fprintf)(fp, "\n");
-
-   VG_(fprintf)(fp, "Parent PID: %d\n", VG_(getppid)());
-   VG_(fprintf)(fp, "Current PID: %d\n", VG_(getpid)());
-   VG_(fprintf)(fp, "\nTrace: \n\n");
 }
 
+static void fr_output_footer(VgFile* fp)
+{
+   if (is_json)
+      VG_(fprintf)(fp, "}");
+}
 // ---------------------------------------------------------------
 //  Stack tracing
 // ---------------------------------------------------------------
@@ -1039,6 +1096,7 @@ static Bool fr_process_cmd_line_option(const HChar* arg)
     else if (VG_BINT_CLO(arg, "--report", clo_report_len, 1, clo_max_trace)) {}
     else if (VG_BINT_CLO(arg, "--min", clo_min, 0, 1024*1024*1024))          {}
     else if (VG_STR_CLO(arg, "--freya-out-file", clo_output))                {}
+    else if (VG_BOOL_CLO(arg, "--json", is_json))                            {}
     else
         return VG_(replacement_malloc_process_cmd_line_option)(arg);
 
@@ -1056,6 +1114,7 @@ static void fr_print_usage(void)
 "    --report=<number>         report depth of stack trace [%d]\n"
 "    --min=<number>            do not report allocations below this size (in bytes) [%d]\n"
 "    --freya-out-file=<str>    output filename to report results [%s]\n"
+"    --json=yes                enable json output\n"
     , clo_trace_len
     , clo_report_len
     , clo_min
@@ -1187,8 +1246,8 @@ static void fr_fini(Int exitcode)
 
    VgFile* fp = fr_output_open();
    fr_output_header(fp);
-
    fr_sort_and_dump(fp, trace_head, 0);
+   fr_output_footer(fp);
 
    VG_(fclose)(fp);
 }
